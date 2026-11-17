@@ -1,0 +1,4 @@
+{
+  "_comment": "Customer reviews are static and human-curated. ONLY add a review from a real customer who gave permission to publish it. Never invent a name, city, rating, date or review text. An empty reviews array is the correct, honest state: the product page shows a 'Be the first to review' empty state, the home page hides its reviews section, and aggregateRating structured data is omitted entirely. Layout fixtures may be added with \"placeholder\": true for local work only — they are filtered out of every render and npm run build REFUSES a production build while any remain.",
+  "reviews": []
+}

@@ -1,0 +1,301 @@
+export const revalidate = 60; // ISR: the admin drops this cache right after a save (see /api/revalidate); 60s is the fallback
+import MediaImage from "@/components/MediaImage";
+import Link from "next/link";
+import { Search, Leaf, ShieldCheck, Heart, Wind, Sparkles, Droplet, Star, ArrowRight } from "lucide-react";
+import FeaturedProducts from "@/components/FeaturedProducts";
+import { reviews } from "@/data/reviews";
+import HeroCarousel from "@/components/HeroCarousel";
+import WhyChooseUs from "@/components/WhyChooseUs";
+import { API_BASE_URL } from "@/utils/apiUrl";
+import { apiGetJson, shouldThrowOnFetchFailure } from "@/utils/apiFetch";
+import { CatalogueLoading } from "@/components/CatalogueLoading";
+import ProfileRequiredNotice from "@/components/ProfileRequiredNotice";
+import { getMainImageUrl } from "@/lib/productImage";
+
+export const metadata = {
+  title: "MERUVEDA | Authentic Ayurvedic Products",
+  description: "Authentic Ayurvedic medicines, lab-tested for purity and potency.",
+};
+
+async function getBanners() {
+  // The backend is a separate service and can be COLD right after a deploy.
+  // The fetch is retried for about eight seconds, and if it still fails the
+  // error is THROWN so the App Router keeps serving the last good ISR page
+  // instead of replacing the home page with an empty hero.
+  const json = await apiGetJson<any>(`${API_BASE_URL}/banners`, {
+    next: { revalidate: 60, tags: ['products'] },
+    label: 'Home/banners',
+  });
+  return json?.data || [];
+}
+
+async function getFeaturedProducts() {
+  const json = await apiGetJson<any>(`${API_BASE_URL}/products?isFeatured=true&limit=4`, {
+    next: { revalidate: 60, tags: ['products'] },
+    label: 'Home/featured',
+  });
+  return (json?.data || []).map((p: any) => {
+    // The MAIN image is the first one, whatever shape the catalogue stores it
+    // in (plain urls or {id,url,alt} entries).
+    const img = getMainImageUrl(p.images, '/images/product_oil.png');
+    const price = (p.sellingPrice !== undefined && p.sellingPrice !== null && p.sellingPrice < p.price) ? p.sellingPrice : p.price;
+    const originalPrice = (p.sellingPrice !== undefined && p.sellingPrice !== null && p.sellingPrice < p.price) ? p.price : null;
+    const discount = originalPrice ? `${Math.round(((originalPrice - price) / originalPrice) * 100)}% OFF` : null;
+
+    return {
+      id: p.id,
+      name: p.name,
+      price,
+      originalPrice,
+      img,
+      discount,
+      isFeatured: true,
+      isBestSeller: p.isBestSeller,
+      isTrending: p.isTrending,
+      isRecommended: p.isRecommended,
+      tag: (p.isFeatured === true || p.isFeatured === 'true') ? 'Featured' : undefined,
+      gst: p.gst !== undefined ? p.gst : (p.seoMetadata?.gst !== undefined ? p.seoMetadata.gst : 18)
+    };
+  });
+}
+
+/**
+ * "What customers say" reads from the static, human-curated list, not the
+ * database.
+ *
+ * The old version called /reviews/featured and mapped rows into review cards. It
+ * had two problems: it depended on a database feature that may not exist, and
+ * it surfaced whatever the database happened to contain. Curated real reviews
+ * are safer and honest by construction, and the section hides itself entirely
+ * while the list is empty rather than showing filler.
+ */
+function getHomepageReviews() {
+  return reviews
+    .slice()
+    .sort((a, b) => b.date.localeCompare(a.date))
+    .slice(0, 6)
+    .map((r) => ({
+      text: r.text,
+      author: r.name,
+      product: r.productId === 'all' ? '' : r.productId,
+      rating: r.rating,
+      verified: r.verified === true,
+    }));
+}
+
+async function getBlogPosts() {
+  const json = await apiGetJson<any>(`${API_BASE_URL}/blogs?status=published`, {
+    next: { revalidate: 60, tags: ['products'] },
+    label: 'Home/blogs',
+  });
+  return json?.data || [];
+}
+
+/** The card shape the "What customers say" section renders. */
+interface Review {
+  text: string;
+  author: string;
+  product: string;
+  rating: number;
+  verified: boolean;
+}
+
+export default async function Home({
+  searchParams,
+}: {
+  searchParams?: Promise<{ profile?: string }>;
+}) {
+  // The backend is a separate service and can be COLD right after a deploy (or
+  // simply not running in development). The fetch is retried for about eight
+  // seconds; if it still fails:
+  //   - in PRODUCTION the error is thrown, so the App Router keeps serving the
+  //     last good ISR page instead of replacing the home page with an empty
+  //     hero;
+  //   - during the BUILD, and in development, a friendly "please refresh"
+  //     state is rendered instead - a deployment must not fail because the
+  //     backend is not up yet, and a developer without the backend should
+  //     still see the page.
+  /**
+   * Was the visitor sent here from the profile area because they have no
+   * profile yet? The flag is read on the server, so the explanation is in
+   * the very first paint.
+   */
+  let profileRequired = false;
+  try {
+    const params = (await searchParams) || {};
+    profileRequired = params.profile === 'required';
+  } catch {
+    profileRequired = false;
+  }
+
+  const settle = async <T,>(label: string, run: () => Promise<T>, fallback: T): Promise<T> => {    try {
+      return await run();
+    } catch (error) {
+      if (!shouldThrowOnFetchFailure()) {
+        console.warn(`[Home] ${label} was not reachable.`);
+        return fallback;
+      }
+      throw error;
+    }
+  };
+
+  const [products, banners, featuredReviews, blogPosts] = await Promise.all([
+    settle('products', getFeaturedProducts, [] as Awaited<ReturnType<typeof getFeaturedProducts>>),
+    settle('banners', getBanners, [] as Awaited<ReturnType<typeof getBanners>>),
+    Promise.resolve(getHomepageReviews()),
+    settle('blogs', getBlogPosts, [] as Awaited<ReturnType<typeof getBlogPosts>>),
+  ]);
+
+  // Nothing came back from the catalogue: show the friendly state rather than
+  // an empty page.
+  if (!products.length && !banners.length) {
+    return (
+      <div className="min-h-screen bg-ivory/30 flex items-center justify-center px-6">
+        <CatalogueLoading label="the catalogue" />
+      </div>
+    );
+  }
+
+  const reviews = featuredReviews;
+  const postsToShow = blogPosts.slice(0, 3);
+
+  return (
+    <div className="pb-20 relative">
+      {/* The visitor was sent here from the profile area because they have no
+          profile yet. One small, dismissible line - never a loop. The flag is
+          read on the server, so the line is there with the first paint. */}
+      <ProfileRequiredNotice show={profileRequired} />
+
+      {/* Hero Slideshow Section */}
+      <HeroCarousel initialBanners={banners} />
+
+      {/* Products Section — top padding gives the hero banner room to breathe
+          before the Best Sellers content starts. */}
+      <section className="container mx-auto px-6 pt-16 md:pt-24 pb-12 md:pb-20 relative z-20">
+        <div className="text-center mb-12">
+          <h2 className="text-4xl font-playfair font-bold text-deep-purple mb-4">Best Sellers</h2>
+          <p className="text-gray-600">Discover our most loved Ayurvedic remedies.</p>
+        </div>
+
+        <FeaturedProducts products={products} />
+
+        <div className="mt-12 flex flex-col sm:flex-row items-center justify-center gap-3">
+          <Link
+            href="/products"
+            className="inline-flex items-center gap-2 bg-gold text-deep-purple px-10 py-3.5 rounded-full font-bold hover:bg-gold-light transition-all shadow-md hover:shadow-lg w-full sm:w-auto justify-center"
+          >
+            Shop Now
+            <ArrowRight size={18} />
+          </Link>
+          <Link href="/products" className="inline-flex items-center gap-2 bg-deep-purple text-white px-8 py-3 rounded-full font-medium hover:bg-deep-purple/90 transition-colors w-full sm:w-auto justify-center">
+            View Full Catalog
+            <ArrowRight size={18} />
+          </Link>
+        </div>
+      </section>
+
+      {/* Why MeruVeda */}
+      <WhyChooseUs />
+
+
+
+      {/* Blog Section */}
+      <section className="py-24 bg-ivory border-b border-gray-100">
+        <div className="container mx-auto px-6">
+          <div className="flex justify-between items-end mb-12">
+            <div>
+              <h2 className="text-4xl font-playfair font-bold text-deep-purple mb-4">Ayurvedic Journal</h2>
+              <p className="text-gray-600">Wisdom for modern holistic living.</p>
+            </div>
+            <Link href="/blog" className="hidden md:flex items-center gap-2 font-medium text-deep-purple border-b border-deep-purple pb-1 hover:text-gold hover:border-gold transition-colors">
+              Read More
+              <ArrowRight size={16} />
+            </Link>
+          </div>
+
+          {postsToShow.length === 0 ? (
+            <div className="text-center py-12 px-4 bg-white/60 backdrop-blur-md rounded-3xl border border-amber-100 shadow-sm max-w-xl mx-auto space-y-4">
+              <p className="text-sm text-gray-500 font-light">No journal articles available yet. Check back soon!</p>
+            </div>
+          ) : (
+            <div className="grid md:grid-cols-3 gap-8">
+              {postsToShow.map((post: any, i: number) => {
+                const formattedDate = post.publishedAt 
+                  ? new Date(post.publishedAt).toLocaleDateString('en-US', { month: 'short', day: '2-digit', year: 'numeric' })
+                  : new Date(post.createdAt).toLocaleDateString('en-US', { month: 'short', day: '2-digit', year: 'numeric' });
+                
+                const category = (post.tags && post.tags.length > 0) ? post.tags[0] : 'Wellness';
+                const img = post.featuredImage || '/images/blog_ashwagandha.png';
+                const author = post.author || 'MERUVEDA';
+                const slug = post.slug || post.id;
+                const readTime = post.readTime || '5 min read';
+
+                return (
+                  <Link href={`/blog/${slug}`} key={post.id || i} className="group cursor-pointer flex flex-col h-full">
+                    <div className="relative h-60 rounded-xl overflow-hidden mb-6">
+                      <MediaImage src={img} alt={post.title} fill sizes="(max-width: 768px) 100vw, 33vw" className="object-cover group-hover:scale-105 transition-transform duration-500" />
+                      <div className="absolute top-4 left-4 bg-gold text-deep-purple text-xs font-bold px-3 py-1 rounded-full shadow-md">
+                        {category}
+                      </div>
+                    </div>
+                    <div className="flex items-center justify-between text-sm text-rust font-medium mb-3">
+                      <span>{formattedDate}</span>
+                      <span className="text-gray-400 flex items-center gap-1"><Droplet size={14} className="opacity-0" />{readTime}</span>
+                    </div>
+                    <h3 className="text-xl font-playfair font-bold text-deep-purple group-hover:text-gold transition-colors mb-3 flex-1">{post.title}</h3>
+                    <div className="text-sm text-gray-500 font-medium">By {author}</div>
+                  </Link>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </section>
+
+      {/* Testimonials */}
+      {reviews.length > 0 && (
+        <section className="py-24 bg-white">
+          <div className="container mx-auto px-6">
+            <div className="text-center mb-16">
+              <h2 className="text-4xl font-playfair font-bold text-deep-purple mb-4">What customers say</h2>
+              <p className="text-gray-600">
+                Real reviews from customers who gave permission to publish them.
+              </p>
+            </div>
+
+            <div className="grid md:grid-cols-3 gap-8">
+              {reviews.map((review: Review, i: number) => (
+                <div key={i} className="bg-ivory p-8 rounded-2xl shadow-sm border border-gray-100 hover:shadow-lg transition-shadow relative flex flex-col h-full">
+                  <div className="text-gold opacity-20 text-6xl font-serif absolute top-4 left-4">&quot;</div>
+                  <p className="text-gray-700 italic relative z-10 mb-6 mt-4 flex-1">&quot;{review.text}&quot;</p>
+                  <div className="flex items-center gap-3">
+                    <div className="w-12 h-12 bg-rust text-white rounded-full flex items-center justify-center font-bold font-playfair text-xl flex-shrink-0">
+                      {review.author[0]}
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-1.5 mb-0.5">
+                        <h5 className="font-bold text-deep-purple">{review.author}</h5>
+                        {/* Only claim "verified" when the review actually is. */}
+                        {review.verified && (
+                          <span title="Verified customer">
+                            <ShieldCheck size={14} className="text-green-600" />
+                          </span>
+                        )}
+                      </div>
+                      <div className="flex text-gold mb-1">
+                        {[1, 2, 3, 4, 5].map(star => <Star key={star} size={12} className={star <= (review.rating || 5) ? "fill-gold" : ""} />)}
+                      </div>
+                      {review.product && (
+                        <div className="text-xs text-gray-500 font-medium">Purchased: <span className="text-deep-purple">{review.product}</span></div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </section>
+      )}
+    </div>
+  );
+}

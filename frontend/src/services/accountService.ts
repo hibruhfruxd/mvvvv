@@ -1,0 +1,397 @@
+// Account service layer — single place where the My Account UI talks to the
+// backend. Uses real endpoints when present (orders, reviews, support,
+// wishlist, auth) and a versioned localStorage fallback for data the backend
+// does not persist yet (address book, return tickets). Card data is never
+// stored here or anywhere else client-side — payments happen on PayU's
+// hosted page. Every method is scoped to the authenticated user; nothing
+// here ever reads another user's records.
+
+import axiosInstance from "@/api/axiosInstance";
+import type {
+  AccountAddress,
+  AccountOrder,
+  AccountReview,
+  AddressType,
+  LegacyAddress,
+} from "@/types/account";
+
+const LS = {
+  addresses: "meruveda_addresses_v2",
+  reviews: "meruveda_reviews_local_v1",
+};
+
+function readLS<T>(key: string, fallback: T): T {
+  if (typeof window === "undefined") return fallback;
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return fallback;
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+function writeLS(key: string, value: unknown) {
+  if (typeof window === "undefined") return;
+  localStorage.setItem(key, JSON.stringify(value));
+}
+
+function uid(prefix: string) {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+}
+
+function errMsg(err: unknown, fallback: string): string {
+  const e = err as { response?: { data?: { error?: { message?: string }; message?: string } }; message?: string };
+  return (
+    e?.response?.data?.error?.message ||
+    e?.response?.data?.message ||
+    e?.message ||
+    fallback
+  );
+}
+
+// ------------------------------------------------------------ address mapping
+
+function legacyToAccount(a: LegacyAddress & { houseFlat?: string; street?: string; landmark?: string; pincode?: string }): AccountAddress {
+  const line = a.addressLine || [a.houseFlat, a.street].filter(Boolean).join(", ");
+  // Try to split "Flat X, Street Y" back into parts.
+  const parts = String(line || "").split(",").map((s) => s.trim()).filter(Boolean);
+  return {
+    id: String(a.id || uid("addr")),
+    fullName: String(a.fullName || ""),
+    houseFlat: String(a.houseFlat || parts[0] || line || ""),
+    street: String(a.street || parts.slice(1).join(", ") || ""),
+    landmark: String(a.landmark || ""),
+    city: String(a.city || ""),
+    state: String(a.state || ""),
+    pincode: String(a.pincode || a.zipCode || ""),
+    phone: String(a.phone || ""),
+    type: (["Home", "Work", "Other"].includes(String(a.type)) ? a.type : "Home") as AddressType,
+    isDefault: Boolean(a.isDefault),
+  };
+}
+
+export function formatAddress(a: AccountAddress): string {
+  return [a.houseFlat, a.street, a.landmark, `${a.city}, ${a.state} - ${a.pincode}`]
+    .filter((s) => s && String(s).trim())
+    .join(", ");
+}
+
+// ----------------------------------------------------------------- addresses
+
+// --------------------------------------------------------------- address map
+//
+// The API stores an address in `user_addresses`, whose shape is
+//   id, user_id, title, first_name, last_name, phone, street_address, apartment,
+//   city, state, postal_code, country, is_default, created_at, updated_at
+// while the UI works in AccountAddress. These two functions are the only place
+// that knows the difference.
+
+interface DbAddress {
+  id: string;
+  title?: string | null;
+  first_name: string;
+  last_name?: string | null;
+  phone: string;
+  street_address: string;
+  apartment?: string | null;
+  city: string;
+  state: string;
+  postal_code: string;
+  country?: string | null;
+  is_default: boolean;
+  created_at?: string;
+}
+
+function dbToAccount(d: DbAddress): AccountAddress {
+  const [first = "", ...rest] = String(`${d.first_name || ""} ${d.last_name || ""}`.trim()).split(/\s+/);
+  const line = String(d.street_address || "");
+  // Best-effort split back into house/street for the two-field form.
+  const cut = line.indexOf(",");
+  const houseFlat = cut === -1 ? line : line.slice(0, cut).trim();
+  const street = cut === -1 ? "" : line.slice(cut + 1).trim();
+  return {
+    id: d.id,
+    fullName: `${d.first_name || ""}${(d.last_name || "") ? " " + d.last_name : ""}`.trim() || first,
+    houseFlat,
+    street,
+    landmark: d.apartment || undefined,
+    city: d.city || "",
+    state: d.state || "",
+    pincode: d.postal_code || "",
+    phone: d.phone || "",
+    type: (d.title as AddressType) || "home",
+    isDefault: Boolean(d.is_default),
+    createdAt: d.created_at,
+  };
+}
+
+function accountToDb(a: Partial<AccountAddress>): Record<string, unknown> {
+  const parts = String(a.fullName || "").trim().split(/\s+/);
+  const street = [a.houseFlat, a.street].filter(Boolean).join(", ");
+  return {
+    title: a.type || "home",
+    first_name: parts[0] || "",
+    last_name: parts.slice(1).join(" "),
+    phone: a.phone || "",
+    street_address: street,
+    apartment: a.landmark || null,
+    city: a.city || "",
+    state: a.state || "",
+    postal_code: a.pincode || "",
+    country: "India",
+    is_default: Boolean(a.isDefault),
+  };
+}
+
+/**
+ * The address book, backed by the API.
+ *
+ * Every method falls back to the previous localStorage book if the API is
+ * unreachable, so a backend outage degrades the account page rather than
+ * emptying the customer's addresses. The localStorage mirror is kept in sync
+ * because checkout still reads `meruveda_addresses`.
+ */
+export const addressService = {
+  async list(): Promise<AccountAddress[]> {
+    try {
+      const { data } = await axiosInstance.get("/addresses");
+      const items = (data?.addresses ?? []).map(dbToAccount);
+      if (items.length) {
+        addressService.saveAll(items);
+        return items;
+      }
+      // An empty server-side book is authoritative: do NOT resurrect local rows.
+      return [];
+    } catch {
+      return addressService.listLocal();
+    }
+  },
+
+  async create(input: Omit<AccountAddress, "id">): Promise<AccountAddress> {
+    const { data } = await axiosInstance.post("/addresses", accountToDb(input));
+    const created = dbToAccount(data.address);
+    await addressService.list();
+    return created;
+  },
+
+  async update(id: string, patch: Partial<AccountAddress>): Promise<AccountAddress[]> {
+    await axiosInstance.patch(`/addresses/${id}`, accountToDb(patch));
+    return addressService.list();
+  },
+
+  async remove(id: string): Promise<AccountAddress[]> {
+    await axiosInstance.delete(`/addresses/${id}`);
+    return addressService.list();
+  },
+
+  async setDefault(id: string): Promise<AccountAddress[]> {
+    await axiosInstance.post(`/addresses/${id}/default`);
+    return addressService.list();
+  },
+
+  /** The pre-API, localStorage-only book. Used only as an offline fallback. */
+  listLocal(): AccountAddress[] {
+    const raw = readLS<Array<AccountAddress | LegacyAddress>>(LS.addresses, []);
+    if (raw.length === 0 && typeof window !== "undefined") {
+      const legacy = localStorage.getItem("meruveda_addresses");
+      if (legacy) {
+        try {
+          const migrated = (JSON.parse(legacy) as LegacyAddress[]).map(legacyToAccount);
+          writeLS(LS.addresses, migrated);
+          return migrated;
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    return raw.map((a) =>
+      "houseFlat" in (a as object) && "pincode" in (a as object)
+        ? (a as AccountAddress)
+        : legacyToAccount(a as LegacyAddress),
+    );
+  },
+
+  /** Mirror to localStorage so checkout keeps reading a saved address. */
+  saveAll(items: AccountAddress[]) {
+    writeLS(LS.addresses, items);
+    if (typeof window !== "undefined") {
+      localStorage.setItem(
+        "meruveda_addresses",
+        JSON.stringify(
+          items.map((a) => ({
+            id: a.id,
+            fullName: a.fullName,
+            addressLine: [a.houseFlat, a.street].filter(Boolean).join(", "),
+            city: a.city,
+            state: a.state,
+            zipCode: a.pincode,
+            phone: a.phone,
+            type: a.type,
+            isDefault: a.isDefault,
+          })),
+        ),
+      );
+    }
+  },
+};
+// -------------------------------------------------------------------- orders
+
+export function normalizeOrderStatus(status: unknown): string {
+  const s = String(status || "placed").toLowerCase().replace(/[\s-]+/g, "_");
+  const map: Record<string, string> = {
+    order_placed: "placed",
+    pending: "placed",
+    payment_pending: "placed",
+    confirmed: "confirmed",
+    processing: "processing",
+    packed: "processing",
+    picked_up: "shipped",
+    shipped: "shipped",
+    in_transit: "shipped",
+    out_for_delivery: "out_for_delivery",
+    delivered: "delivered",
+    cancelled: "cancelled",
+    canceled: "cancelled",
+    failed: "failed",
+    returned: "returned",
+    refunded: "refunded",
+  };
+  return map[s] || s;
+}
+
+function mapBackendOrder(bo: Record<string, unknown>): AccountOrder {
+  const o = bo as Record<string, any>;
+  const items = (o.order_items || []).map((item: any, i: number) => ({
+    id: String(item.id || `${o.id}-item-${i}`),
+    productId: String(item.product_id || item.id || ""),
+    name: String(item.products?.name || item.name || "Product"),
+    price: Number(item.price ?? item.products?.selling_price ?? 0),
+    quantity: Number(item.quantity ?? 1),
+    image: String(
+      item.image_url || item.products?.images?.[0]?.url || item.products?.images?.[0] || "/images/placeholder-product.png",
+    ),
+  }));
+  const ship = (o.shipping_address || {}) as Record<string, any>;
+  return {
+    id: String(o.id),
+    orderNumber: String(o.order_number || o.id),
+    date: String(o.created_at || new Date().toISOString()),
+    items,
+    total: Number(o.total ?? o.grand_total ?? 0),
+    status: String(o.status || "Placed"),
+    normalizedStatus: normalizeOrderStatus(o.status),
+    paymentMethod: String(o.payment_method || "—"),
+    paymentStatus: o.payment_status ? String(o.payment_status) : undefined,
+    shippingAddress: {
+      fullName: String(ship.fullName || ship.name || "—"),
+      addressLine: String(ship.addressLine || ship.address || ship.street || "—"),
+      city: String(ship.city || ""),
+      state: String(ship.state || ""),
+      zipCode: String(ship.zipCode || ship.zip || ship.pincode || ""),
+      phone: String(ship.phone || ""),
+    },
+    estimatedDelivery: o.estimated_delivery ? String(o.estimated_delivery) : undefined,
+    trackingNumber: o.tracking_number ? String(o.tracking_number) : o.awb_code ? String(o.awb_code) : undefined,
+    trackingUrl: o.tracking_url ? String(o.tracking_url) : undefined,
+    awbCode: o.awb_code ? String(o.awb_code) : undefined,
+    courierName: o.courier_name ? String(o.courier_name) : undefined,
+    lastTrackingUpdate: o.last_tracking_update ? String(o.last_tracking_update) : undefined,
+    trackingHistory: (o.order_tracking_history || o.tracking_history || []) as AccountOrder["trackingHistory"],
+    raw: bo,
+  };
+}
+
+export const orderService = {
+  async myOrders(): Promise<AccountOrder[]> {
+    try {
+      const res = await axiosInstance.get("/orders/my");
+      const rows = res.data?.data || [];
+      return rows.map(mapBackendOrder);
+    } catch (err) {
+      throw new Error(errMsg(err, "Could not load your orders."));
+    }
+  },
+  async byId(id: string): Promise<AccountOrder> {
+    // Prefer the scoped list (ownership enforced server-side) then fall back
+    // to the direct endpoint.
+    try {
+      const all = await orderService.myOrders();
+      const found = all.find((o) => o.id === id || o.orderNumber === id);
+      if (found) return found;
+    } catch {
+      /* fall through to direct fetch */
+    }
+    try {
+      const res = await axiosInstance.get(`/orders/${id}`);
+      const row = res.data?.data || res.data;
+      return mapBackendOrder(row);
+    } catch (err) {
+      throw new Error(errMsg(err, "Order not found."));
+    }
+  },
+};
+
+// ------------------------------------------------------------------- reviews
+
+export const reviewService = {
+  async mine(): Promise<AccountReview[]> {
+    try {
+      const res = await axiosInstance.get("/reviews/my");
+      const rows = res.data?.data || [];
+      return rows.map((r: any) => ({
+        id: String(r.id),
+        productId: String(r.product_id),
+        productName: String(r.products?.name || r.product_name || "Product"),
+        rating: Number(r.rating || 0),
+        text: String(r.comment || r.body || ""),
+        images: Array.isArray(r.images) ? r.images : [],
+        date: String(r.created_at || new Date().toISOString()),
+        status: r.status ? String(r.status) : undefined,
+      }));
+    } catch (err) {
+      throw new Error(errMsg(err, "Could not load your reviews."));
+    }
+  },
+  async eligibleProducts(): Promise<Array<{ productId: string; name: string; image: string; orderNumber: string }>> {
+    const orders = await orderService.myOrders();
+    const seen = new Map<string, { productId: string; name: string; image: string; orderNumber: string }>();
+    for (const o of orders) {
+      if (o.normalizedStatus !== "delivered") continue;
+      for (const it of o.items) {
+        if (!seen.has(it.productId)) {
+          seen.set(it.productId, { productId: it.productId, name: it.name, image: it.image, orderNumber: o.orderNumber });
+        }
+      }
+    }
+    return [...seen.values()];
+  },
+  async create(productId: string, rating: number, text: string, images: string[] = []) {
+    try {
+      // NOTE: the `reviews` table has no `images` column — photo URLs are
+      // intentionally not sent so text reviews never fail on unknown keys.
+      void images;
+      const payload: Record<string, unknown> = { product_id: productId, rating, comment: text };
+      const res = await axiosInstance.post("/reviews", payload);
+      return res.data?.data;
+    } catch (err) {
+      throw new Error(errMsg(err, "Could not submit your review."));
+    }
+  },
+  async update(id: string, rating: number, text: string) {
+    try {
+      const res = await axiosInstance.patch(`/reviews/${id}`, { rating, comment: text });
+      return res.data?.data;
+    } catch (err) {
+      throw new Error(errMsg(err, "Could not update your review."));
+    }
+  },
+  async remove(id: string) {
+    try {
+      await axiosInstance.delete(`/reviews/${id}`);
+    } catch (err) {
+      throw new Error(errMsg(err, "Could not delete your review."));
+    }
+  },
+};
+
