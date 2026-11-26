@@ -3,7 +3,7 @@
 import { useEffect, useRef } from "react";
 import { usePathname } from "next/navigation";
 import axiosInstance from "@/api/axiosInstance";
-import { getSessionId } from "@/lib/analytics";
+import { getSessionId, trackPixelPageView } from "@/lib/analytics";
 
 function getDeviceType(): string {
   if (typeof navigator === "undefined") return "desktop";
@@ -14,9 +14,9 @@ function getDeviceType(): string {
 }
 
 /**
- * First-party pageview beacon. Fires once per route change, fire-and-forget
- * (errors swallowed) so a tracking failure never affects navigation or UX.
- * Backs the admin Analytics traffic cards.
+ * First-party pageview beacon + SPA route-change Meta Pixel PageView.
+ * Fires once per route change, fire-and-forget (errors swallowed) so a tracking
+ * failure never affects navigation or UX. Backs the admin Analytics traffic cards.
  */
 export default function PageViewTracker() {
   const pathname = usePathname();
@@ -24,7 +24,14 @@ export default function PageViewTracker() {
 
   useEffect(() => {
     if (!pathname || lastTracked.current === pathname) return;
+    const isRouteChange = lastTracked.current !== null;
     lastTracked.current = pathname;
+
+    // Initial PageView is fired by AnalyticsScripts on load; fire subsequent
+    // Next.js App Router client-side navigations here.
+    if (isRouteChange) {
+      trackPixelPageView();
+    }
 
     try {
       axiosInstance

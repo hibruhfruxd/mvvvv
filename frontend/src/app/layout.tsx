@@ -61,8 +61,7 @@ export default function RootLayout({
         <PageViewTracker />
         <CardVaultCleanup />
         <BeaconProvider />
-        {/* GA4 + Meta Pixel: gated only by the ANALYTICS_ENABLED master switch
-            + their env ids. No consent banner exists on the site. */}
+        {/* GA4 (env-gated) + Meta Pixel (defaults to 1106420419060702). */}
         <AnalyticsScripts />
       </body>
     </html>

@@ -1,27 +1,27 @@
 "use client";
 
 import Script from "next/script";
-import { analyticsEnabled } from "@/lib/analytics";
+import { analyticsEnabled, gaId, metaPixelSwitchEnabled, pixelId } from "@/lib/analytics";
 
 /**
  * GA4 + Meta Pixel loader, mounted once in the root layout so the scripts land
- * in <head> on every page. There is no consent gate: both vendors load purely
- * on the ANALYTICS_ENABLED master switch + their env id.
+ * in the document on every page. There is no consent gate.
  *
- * A missing id emits nothing — the noscript fallback and the loader are both
- * skipped, so dev/preview stay clean.
+ * - GA4 loads when NEXT_PUBLIC_ANALYTICS_ENABLED === "true" and NEXT_PUBLIC_GA_ID is set.
+ * - Meta Pixel uses NEXT_PUBLIC_META_PIXEL_ID (defaulting to 1106420419060702)
+ *   unless NEXT_PUBLIC_ANALYTICS_ENABLED === "false" or NEXT_PUBLIC_META_PIXEL_ID === "".
  */
 export default function AnalyticsScripts() {
-  const enabled = analyticsEnabled();
-  const gaId = process.env.NEXT_PUBLIC_GA_ID;
-  const pixelId = process.env.NEXT_PUBLIC_META_PIXEL_ID;
+  const gaActive = analyticsEnabled() && !!gaId();
+  const resolvedGaId = gaId();
+  const resolvedPixelId = metaPixelSwitchEnabled() ? pixelId() : "";
 
   return (
     <>
-      {enabled && gaId ? (
+      {gaActive ? (
         <>
           <Script
-            src={`https://www.googletagmanager.com/gtag/js?id=${gaId}`}
+            src={`https://www.googletagmanager.com/gtag/js?id=${resolvedGaId}`}
             strategy="afterInteractive"
             id="ga4-loader"
           />
@@ -31,46 +31,34 @@ export default function AnalyticsScripts() {
               function gtag(){dataLayer.push(arguments);}
               window.gtag = window.gtag || gtag;
               gtag('js', new Date());
-              gtag('config', '${gaId}', { send_page_view: true });
+              gtag('config', '${resolvedGaId}', { send_page_view: true });
             `}
           </Script>
         </>
       ) : null}
 
-      {enabled && pixelId ? (
+      {resolvedPixelId ? (
         <>
-          <Script
-            src="https://connect.facebook.net/en_US/fbevents.js"
-            strategy="afterInteractive"
-            id="meta-pixel"
-            onLoad={() => {
-              try {
-                // Standard Meta pixel bootstrap. `eventID` is passed per event by
-                // lib/analytics so a future server-side Conversions API event can
-                // be deduplicated against it.
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                const fbq = ((window as any).fbq =
-                  (window as any).fbq ||
-                  function (...args: unknown[]) {
-                    ((fbq as any).q = (fbq as any).q || []).push(args);
-                  });
-                if (!(fbq as any).initialized) {
-                  (fbq as any).initialized = true;
-                  (fbq as any).q = [];
-                  fbq("init", pixelId);
-                  fbq("track", "PageView");
-                }
-              } catch {
-                /* pixel is best-effort */
-              }
-            }}
-          />
+          <Script id="meta-pixel" strategy="afterInteractive">
+            {`
+              !function(f,b,e,v,n,t,s)
+              {if(f.fbq)return;n=f.fbq=function(){n.callMethod?
+              n.callMethod.apply(n,arguments):n.queue.push(arguments)};
+              if(!f._fbq)f._fbq=n;n.push=n;n.loaded=!0;n.version='2.0';
+              n.queue=[];t=b.createElement(e);t.async=!0;
+              t.src=v;s=b.getElementsByTagName(e)[0];
+              s.parentNode.insertBefore(t,s)}(window, document,'script',
+              'https://connect.facebook.net/en_US/fbevents.js');
+              fbq('init', '${resolvedPixelId}');
+              fbq('track', 'PageView');
+            `}
+          </Script>
           <noscript>
             <img
               height="1"
               width="1"
               style={{ display: "none" }}
-              src={`https://www.facebook.com/tr?id=${pixelId}&ev=PageView&noscript=1`}
+              src={`https://www.facebook.com/tr?id=${resolvedPixelId}&ev=PageView&noscript=1`}
               alt=""
             />
           </noscript>

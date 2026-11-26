@@ -2,20 +2,26 @@
  * Analytics wrapper — one entry point, fanned out to every backend we use.
  *
  *   track()  ->  first-party beacon (ours, cookieless)
- *                GA4 + Meta Pixel   (gated by env ids + ANALYTICS_ENABLED)
+ *                GA4                (gated by NEXT_PUBLIC_ANALYTICS_ENABLED=true + NEXT_PUBLIC_GA_ID)
+ *                Meta Pixel         (defaults to 1106420419060702; set NEXT_PUBLIC_ANALYTICS_ENABLED=false
+ *                                    or NEXT_PUBLIC_META_PIXEL_ID="" to disable)
  *
  * Design rules, all enforced here rather than at each call site:
- *   0. GA4 + Meta Pixel sit behind the ANALYTICS_ENABLED master switch, which
- *      is OFF by default (see analyticsEnabled).
+ *   0. GA4 sits behind NEXT_PUBLIC_ANALYTICS_ENABLED === "true" + NEXT_PUBLIC_GA_ID.
+ *      Meta Pixel uses NEXT_PUBLIC_META_PIXEL_ID (defaulting to DEFAULT_META_PIXEL_ID)
+ *      and is active unless NEXT_PUBLIC_ANALYTICS_ENABLED === "false" or
+ *      NEXT_PUBLIC_META_PIXEL_ID === "".
  *   1. There is no consent banner and no consent gate anywhere — vendor scripts
- *      load and fire based purely on the env ids + the master switch.
- *   2. Missing env ids (NEXT_PUBLIC_GA_ID / NEXT_PUBLIC_META_PIXEL_ID) mean the
- *      scripts were never rendered, so the global is absent and we skip.
+ *      load and fire based purely on the config + switch.
+ *   2. Missing/empty env ids mean the scripts were never rendered, so we skip.
  *   3. No PII leaves the site. Params are passed through a denylist scrub, and
  *      ids we generate are random — never an email, phone or customer id.
  *   4. `purchase` fires once per order, persisted by order number, so a refresh
  *      (or the polling this page already does) cannot double count.
  */
+
+/** Default storefront Meta Pixel ID (can be overridden or cleared via NEXT_PUBLIC_META_PIXEL_ID). */
+export const DEFAULT_META_PIXEL_ID = "1106420419060702";
 
 /** localStorage key holding order numbers we already counted as a purchase. */
 const PURCHASE_SEEN_KEY = "meruveda_purchase_seen";
@@ -74,6 +80,14 @@ const FIRST_PARTY_EVENTS = new Set([
  */
 export function analyticsEnabled(): boolean {
   return process.env.NEXT_PUBLIC_ANALYTICS_ENABLED === "true";
+}
+
+/**
+ * Meta Pixel loads with DEFAULT_META_PIXEL_ID unless explicitly turned off via
+ * NEXT_PUBLIC_ANALYTICS_ENABLED === "false" or NEXT_PUBLIC_META_PIXEL_ID === "".
+ */
+export function metaPixelSwitchEnabled(): boolean {
+  return process.env.NEXT_PUBLIC_ANALYTICS_ENABLED !== "false";
 }
 
 /**
@@ -229,10 +243,10 @@ export function gaEnabled(): boolean {
   );
 }
 
-/** Same conditions for Meta Pixel. */
+/** Same switch + numeric id check for Meta Pixel. */
 export function pixelEnabled(): boolean {
   return (
-    analyticsEnabled() &&
+    metaPixelSwitchEnabled() &&
     !!pixelId() &&
     typeof globals().fbq === "function"
   );
@@ -243,7 +257,9 @@ export function gaId(): string {
 }
 
 export function pixelId(): string {
-  return process.env.NEXT_PUBLIC_META_PIXEL_ID || "";
+  const configured = process.env.NEXT_PUBLIC_META_PIXEL_ID;
+  const candidate = configured === undefined ? DEFAULT_META_PIXEL_ID : configured.trim();
+  return /^\d+$/.test(candidate) ? candidate : "";
 }
 
 // ---------------------------------------------------------------------------
@@ -295,17 +311,81 @@ function fireGa(event: string, params: TrackParams): void {
   }
 }
 
+const META_STANDARD_EVENTS: Record<string, string> = {
+  view_item: "ViewContent",
+  add_to_cart: "AddToCart",
+  begin_checkout: "InitiateCheckout",
+  add_payment_info: "AddPaymentInfo",
+  purchase: "Purchase",
+};
+
+function buildPixelPayload(
+  clean: Record<string, AnalyticsValue>,
+  items: AnalyticsItem[]
+): Record<string, unknown> {
+  const payload: Record<string, unknown> = { ...clean };
+  if (items.length > 0) {
+    const contentIds = items
+      .map((item) => item.item_id)
+      .filter((id): id is string => typeof id === "string" && id.length > 0);
+    if (contentIds.length > 0) {
+      payload.content_ids = contentIds;
+      payload.content_type = "product";
+    }
+    payload.contents = items.map((item) => ({
+      id: item.item_id,
+      quantity: Number(item.quantity) || 1,
+      item_price: Number(item.price) || 0,
+    }));
+    payload.num_items = items.reduce(
+      (sum, item) => sum + (Number(item.quantity) || 1),
+      0
+    );
+    if (items.length === 1 && items[0].item_name && !payload.content_name) {
+      payload.content_name = items[0].item_name;
+    }
+    if (payload.value === undefined) {
+      payload.value = items.reduce(
+        (sum, item) => sum + (Number(item.price) || 0) * (Number(item.quantity) || 1),
+        0
+      );
+    }
+    if (!payload.currency) {
+      payload.currency = "INR";
+    }
+  }
+  if (clean.transaction_id && !payload.order_id) {
+    payload.order_id = clean.transaction_id;
+  }
+  return payload;
+}
+
 function firePixel(event: string, params: TrackParams, eventId: string): void {
   if (!pixelEnabled()) return;
   try {
     const fbq = globals().fbq!;
     const clean = sanitizeParams(params);
     const items = sanitizeItems(params.items);
-    const payload: Record<string, unknown> = items.length ? { ...clean, items } : { ...clean };
+    const payload = buildPixelPayload(clean, items);
+    const standardEvent = META_STANDARD_EVENTS[event];
     // The same eventID goes to the browser Pixel and, later, to a server-side
     // Conversions API event, so Meta can dedupe the two. We only generate and
     // pass it here — no CAPI call is made.
-    fbq("track", event, payload, { eventID: eventId });
+    if (standardEvent) {
+      fbq("track", standardEvent, payload, { eventID: eventId });
+    } else {
+      fbq("trackCustom", event, payload, { eventID: eventId });
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Fires Meta Pixel PageView on client-side route transitions. */
+export function trackPixelPageView(): void {
+  if (!pixelEnabled()) return;
+  try {
+    globals().fbq!("track", "PageView");
   } catch {
     /* ignore */
   }
